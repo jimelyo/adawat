@@ -1,0 +1,87 @@
+name: Windows installers
+
+# Compiles Adawat-Setup-x64.exe and Adawat-Setup-arm64.exe the way windows/tools/build-installer.sh
+# does on the Windows machine it reaches over SSH: publish the app self-contained, bundle the
+# pinned ffmpeg, and compile windows/installer/Adawat.iss with Inno Setup 6. Run from the Actions tab.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup --no-progress -y
+
+      - name: Download the pinned ffmpeg (x64 and arm64)
+        run: |
+          $tag = 'autobuild-2026-10-18-13-01'
+          $ver = 'n8.1.3-18-g46d899d7a0'
+          $base = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$tag"
+          foreach ($pair in @(@('winarm64','win-arm64'), @('win64','win-x64'))) {
+            $d = "windows/build/ffmpeg/$($pair[1])"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Invoke-WebRequest "$base/ffmpeg-$ver-$($pair[0])-gpl-8.1.zip" -OutFile "$d.zip"
+            Expand-Archive "$d.zip" -DestinationPath "$d/extract" -Force
+            Move-Item (Get-ChildItem -Recurse "$d/extract" -Filter ffmpeg.exe | Select-Object -First 1).FullName "$d/ffmpeg.exe" -Force
+            Move-Item (Get-ChildItem -Recurse "$d/extract" -Filter LICENSE.txt | Select-Object -First 1).FullName "$d/LICENSE.txt" -Force
+            Remove-Item -Recurse -Force "$d/extract", "$d.zip"
+          }
+
+      - name: Publish x64 and arm64 (self-contained, like build-installer.sh)
+        run: |
+          $version = [regex]::Match((Get-Content windows/Directory.Build.props -Raw), '<Version>([^<]+)</Version>').Groups[1].Value
+          "APPVERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          foreach ($arch in @('x64','arm64')) {
+            $out = "windows/build/publish/app-$arch"
+            Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
+            foreach ($p in @('Adawat.App','Adawat.Cli')) {
+              dotnet publish "windows/src/$p/$p.csproj" -f net10.0-windows10.0.22621.0 -c Release -r "win-$arch" --self-contained -p:DebugType=none -o $out
+              if ($LASTEXITCODE) { throw "publish $p (win-$arch) falló" }
+            }
+            if (-not (Test-Path "$out/Adawat.exe") -or -not (Test-Path "$out/adawat-cli.exe")) { throw "publish incompleto para $arch" }
+            New-Item -ItemType Directory -Force "$out/tools" | Out-Null
+            Copy-Item "windows/build/ffmpeg/win-$arch/ffmpeg.exe" "$out/tools/"
+            Copy-Item "windows/build/ffmpeg/win-$arch/LICENSE.txt" "$out/tools/ffmpeg-LICENSE.txt"
+          }
+
+      - name: Make sure the installer's Arabic language file exists
+        run: |
+          $isl = 'C:\Program Files (x86)\Inno Setup 6\Languages\Arabic.isl'
+          if (-not (Test-Path $isl)) {
+            Invoke-WebRequest 'https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/Arabic.isl' -OutFile $isl
+          }
+
+      - name: Compile the installers
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $root = (Resolve-Path .).Path
+          foreach ($arch in @('x64','arm64')) {
+            & $iscc /Q "/DArch=$arch" "/DAppVersion=$env:APPVERSION" "/DSource=$root/windows/build/publish/app-$arch" "$root/windows/installer/Adawat.iss"
+            if ($LASTEXITCODE) { throw "ISCC falló para $arch (exit $LASTEXITCODE)" }
+          }
+          Get-FileHash windows/build/installer/Adawat-Setup-*.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content windows/build/installer/SHA256SUMS.txt
+          Get-Content windows/build/installer/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Adawat-Windows-Setups
+          path: |
+            windows/build/installer/Adawat-Setup-x64.exe
+            windows/build/installer/Adawat-Setup-arm64.exe
+            windows/build/installer/SHA256SUMS.txt
